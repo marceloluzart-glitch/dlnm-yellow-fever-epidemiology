@@ -1,0 +1,410 @@
+import warnings
+import numpy as np
+import pandas as pd
+from patsy import dmatrix
+from scipy import stats
+import statsmodels.api as sm
+from statsmodels.stats.diagnostic import acorr_ljungbox
+
+warnings.filterwarnings("ignore")
+
+CLIMATE_NAMES = {
+    "TMIN_max": "Maximum temperature (°C)",
+    "TMIN_min": "Minimum temperature (°C)",
+    "RH_mean": "Relative humidity (%)",
+    "photoperiod_monthly": "Photoperiod (h)",
+}
+
+MODIFIER_BLOCKS = {
+    "1. IMMUNOLOGICAL AXIS (VACCINATION)": {
+        "cobertura_vacinal": {
+            "label": "Vaccination Deficit (< P50)",
+            "tipo": "menor",
+        }
+    },
+    "2. SOCIOSTRUCTURAL AXIS (IVS)": {
+        "ivs_indice_vulnerabilidade": {
+            "label": "High Overall IVS (> P50)",
+            "tipo": "maior",
+        },
+        "ivs_infraestrutura_urbana": {
+            "label": "Poor Urban Infrastructure (> P50)",
+            "tipo": "maior",
+        },
+        "ivs_capital_humano": {
+            "label": "Poor Human Capital (> P50)",
+            "tipo": "maior",
+        },
+        "ivs_renda_trabalho": {
+            "label": "Poor Income/Labor (> P50)",
+            "tipo": "maior",
+        },
+    },
+    "3. HEALTH SYSTEM RESPONSE AXIS (SUS)": {
+        "enfermeiros_por_10mil": {
+            "label": "Nursing Staff Deficit (< P50)",
+            "tipo": "menor",
+        },
+        "aux_tec_saude_por_10mil": {
+            "label": "Health Tech/Aux Deficit (< P50)",
+            "tipo": "menor",
+        },
+        "estabelecimentos_ambulatorial_sus": {
+            "label": "SUS Outpatient Deficit (< P50)",
+            "tipo": "menor",
+        },
+    },
+}
+
+
+def fit_glm_hac(y, X):
+  maxlags = max(1, int(len(X) ** (1 / 4)))
+  model = sm.GLM(y, X, family=sm.families.Gaussian())
+  return model.fit(cov_type="HAC", cov_kwds={"maxlags": maxlags})
+
+
+def detect_peaks(effects):
+  effects = np.array(effects)
+  smoothed = np.convolve(effects, np.ones(3) / 3, mode="same")
+  return (
+      np.max(smoothed),
+      int(np.argmax(smoothed)),
+      np.min(smoothed),
+      int(np.argmin(smoothed)),
+  )
+
+
+def create_crossbasis(df_in, var, max_lag=6, df_var=3, df_lag=2):
+  x_centered = df_in[var] - df_in[var].median()
+  lag_index = np.arange(max_lag + 1)
+
+  lag_basis = dmatrix(
+      f"bs(lag, df={df_lag}, degree=2, include_intercept=False)",
+      {"lag": lag_index},
+      return_type="dataframe",
+  )
+
+  cross = []
+  col_names = []
+
+  for i in range(df_var):
+    for j in range(lag_basis.shape[1]):
+      term = np.zeros(len(df_in))
+
+      for l in range(max_lag + 1):
+        x_lag = x_centered.shift(l).fillna(0)
+        var_basis_lag = dmatrix(
+            f"bs(x, df={df_var}, degree=3, include_intercept=False)",
+            {"x": x_lag},
+            return_type="dataframe",
+        )
+        term += var_basis_lag.iloc[:, i].values * lag_basis.iloc[l, j]
+
+      cross.append(term)
+      col_names.append(f"{var}_cb_{i}_{j}")
+
+  cb_df = pd.DataFrame(
+      np.column_stack(cross), columns=col_names, index=df_in.index
+  )
+  return cb_df, lag_basis
+
+
+def clean_matrix(X):
+  X = X.loc[:, X.var() > 1e-8]
+  corr = X.corr().abs()
+  upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
+  drop_cols = [c for c in upper.columns if any(upper[c] > 0.95)]
+  return X.drop(columns=drop_cols, errors="ignore")
+
+
+def create_interaction_terms(cb_df, stratum_series, mod_name):
+  inter_cols = []
+  col_names = []
+  for c in cb_df.columns:
+    inter_term = cb_df[c] * stratum_series.values
+    inter_cols.append(inter_term)
+    col_names.append(f"{c}_x_{mod_name}")
+
+  return pd.DataFrame(
+      np.column_stack(inter_cols), columns=col_names, index=cb_df.index
+  )
+
+
+def execute_dlnm_pipeline(df_master):
+  df_dlnm = df_master.copy()
+  df_dlnm = df_dlnm.sort_values(["abbrev_state", "year", "month"]).reset_index(
+      drop=True
+  )
+
+  final_tables = {}
+
+  for block_name, modifier_dict in MODIFIER_BLOCKS.items():
+    print("\n" + "=" * 115)
+    print(f" EXECUTING: {block_name} ")
+    print("=" * 115)
+
+    block_results = []
+    target_states = df_dlnm["abbrev_state"].unique()
+
+    for state in target_states:
+      df_est = (
+          df_dlnm[df_dlnm["abbrev_state"] == state]
+          .copy()
+          .sort_values(["year", "month"])
+          .reset_index(drop=True)
+      )
+
+      if df_est["casos"].sum() < 3 or len(df_est) < 45:
+        continue
+
+      y_raw = np.log1p(df_est["casos"])
+
+      df_est["y_lag1"] = y_raw.shift(1).fillna(0)
+      df_est["y_lag2"] = y_raw.shift(2).fillna(0)
+      df_est["t"] = np.arange(len(df_est))
+      df_est["sin12"] = np.sin(2 * np.pi * df_est["t"] / 12)
+      df_est["cos12"] = np.cos(2 * np.pi * df_est["t"] / 12)
+      df_est["sin6"] = np.sin(4 * np.pi * df_est["t"] / 12)
+      df_est["cos6"] = np.cos(4 * np.pi * df_est["t"] / 12)
+
+      n_years = max(1, len(df_est) / 12)
+      df_t = max(3, int(n_years * 0.8))
+      spline_t = dmatrix(f"bs(t, df={df_t})", df_est, return_type="dataframe")
+
+      X_base = pd.concat(
+          [
+              spline_t,
+              df_est[["y_lag1", "y_lag2", "sin12", "cos12", "sin6", "cos6"]],
+          ],
+          axis=1,
+      )
+
+      seasons = [
+          ("geral", [True] * len(df_est)),
+          (
+              "estacao_chuvosa_quente",
+              df_est["month"].isin([11, 12, 1, 2, 3, 4]),
+          ),
+          ("estacao_seca_fria", df_est["month"].isin([5, 6, 7, 8, 9, 10])),
+      ]
+
+      for season_name, mask in seasons:
+        df_sub = df_est[mask].copy().reset_index(drop=True)
+        y_sub = y_raw[mask].reset_index(drop=True)
+        X_base_sub = X_base.loc[mask].reset_index(drop=True)
+        casos_sub = df_sub["casos"].values
+
+        if len(df_sub) < 30 or y_sub.sum() == 0:
+          continue
+
+        for var_climate in CLIMATE_NAMES.keys():
+          if var_climate not in df_sub.columns:
+            continue
+
+          cb_climate, lb = create_crossbasis(
+              df_sub, var_climate, max_lag=6, df_var=3, df_lag=2
+          )
+
+          for mod_var, mod_info in modifier_dict.items():
+            if mod_var not in df_sub.columns:
+              continue
+
+            median_cut = df_sub[mod_var].median()
+            stratum = (
+                (df_sub[mod_var] < median_cut).astype(float)
+                if mod_info["tipo"] == "menor"
+                else (df_sub[mod_var] > median_cut).astype(float)
+            )
+
+            if stratum.nunique() < 2 or stratum.sum() < 4:
+              continue
+
+            cb_inter = create_interaction_terms(cb_climate, stratum, mod_var)
+
+            X_base_full = pd.concat(
+                [X_base_sub, cb_climate, stratum.rename(f"main_{mod_var}")],
+                axis=1,
+            )
+            X_base_model = sm.add_constant(
+                clean_matrix(X_base_full), has_constant="add"
+            ).dropna()
+
+            try:
+              fit_base = fit_glm_hac(y_sub.loc[X_base_model.index], X_base_model)
+              aic_base = fit_base.aic
+            except Exception:
+              continue
+
+            X_inter_full = pd.concat(
+                [
+                    X_base_sub,
+                    cb_climate,
+                    cb_inter,
+                    stratum.rename(f"main_{mod_var}"),
+                ],
+                axis=1,
+            )
+            X_inter_model = sm.add_constant(
+                clean_matrix(X_inter_full), has_constant="add"
+            ).dropna()
+
+            try:
+              fit_inter = fit_glm_hac(
+                  y_sub.loc[X_inter_model.index], X_inter_model
+              )
+              aic_inter = fit_inter.aic
+            except Exception:
+              continue
+
+            delta_aic = aic_inter - aic_base
+            if delta_aic >= -2.0:
+              continue
+
+            final_fit = fit_inter
+            idx_valid = X_inter_model.index
+
+            cols_base_climate = [
+                c
+                for c in final_fit.params.index
+                if c.startswith(f"{var_climate}_cb_") and "_x_" not in c
+            ]
+            cols_inter = [
+                c for c in final_fit.params.index if f"_x_{mod_var}" in c
+            ]
+
+            eff_protected, eff_vulnerable, grad_inter_lags = [], [], []
+
+            for l in range(7):
+              grad_b, grad_i = [], []
+              for i in range(3):
+                for j in range(lb.shape[1]):
+                  col_b = f"{var_climate}_cb_{i}_{j}"
+                  col_i = f"{var_climate}_cb_{i}_{j}_x_{mod_var}"
+                  if col_b in final_fit.params:
+                    grad_b.append(lb.iloc[l, j])
+                  if col_i in final_fit.params:
+                    grad_i.append(lb.iloc[l, j])
+
+              ef_b = (
+                  final_fit.params[cols_base_climate] @ np.array(grad_b)
+                  if len(grad_b) > 0
+                  else 0
+              )
+              ef_i = (
+                  final_fit.params[cols_inter] @ np.array(grad_i)
+                  if len(grad_i) > 0
+                  else 0
+              )
+              eff_protected.append(ef_b)
+              eff_vulnerable.append(ef_b + ef_i)
+              grad_inter_lags.append(np.array(grad_i))
+
+            p_pos, l_pos, p_neg, l_neg = detect_peaks(eff_vulnerable)
+            peak_lag = l_pos if abs(p_pos) >= abs(p_neg) else l_neg
+
+            grad_peak_inter = grad_inter_lags[peak_lag]
+            if len(grad_peak_inter) > 0 and len(cols_inter) > 0:
+              cov_inter = final_fit.cov_params().loc[
+                  cols_inter, cols_inter
+              ].values
+              var_diff = grad_peak_inter @ cov_inter @ grad_peak_inter
+              se_diff = np.sqrt(max(0, var_diff))
+              ef_diff_peak = eff_vulnerable[peak_lag] - eff_protected[peak_lag]
+              ic_inf, ic_sup = (
+                  ef_diff_peak - 1.96 * se_diff,
+                  ef_diff_peak + 1.96 * se_diff,
+              )
+              z_score = ef_diff_peak / se_diff if se_diff > 0 else 0
+              p_val_peak = 2 * (1 - stats.norm.cdf(abs(z_score)))
+              peak_significant = (
+                  (ic_inf > 0) if ef_diff_peak > 0 else (ic_sup < 0)
+              )
+            else:
+              peak_significant = False
+
+            if not peak_significant:
+              continue
+
+            y_pred_real = np.expm1(final_fit.fittedvalues)
+            X_counterfactual = X_inter_model.copy()
+            for c in cols_inter:
+              X_counterfactual[c] = 0.0
+            if f"main_{mod_var}" in X_counterfactual.columns:
+              X_counterfactual[f"main_{mod_var}"] = 0.0
+
+            y_pred_cf = np.expm1(final_fit.predict(X_counterfactual))
+            avoidable_cases = np.sum(np.maximum(y_pred_real - y_pred_cf, 0))
+            total_cases_sub = np.sum(casos_sub[idx_valid])
+            structural_af = (
+                (avoidable_cases / total_cases_sub) * 100
+                if total_cases_sub > 0
+                else 0.0
+            )
+
+            if int(np.round(avoidable_cases)) == 0 or structural_af <= 0.1:
+              continue
+
+            try:
+              lb_test = acorr_ljungbox(
+                  final_fit.resid_response, lags=[6], return_df=True
+              )
+              lb_pvalue = lb_test["lb_pvalue"].iloc[0]
+            except Exception:
+              lb_pvalue = np.nan
+
+            y_true = y_sub.loc[idx_valid]
+            ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
+            ss_res = np.sum((y_true - final_fit.fittedvalues) ** 2)
+            pseudo_r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
+
+            block_results.append({
+                "Estado": state,
+                "Variavel_Clima": CLIMATE_NAMES[var_climate],
+                "Modificador": mod_info["label"],
+                "Sazonalidade": season_name,
+                "Lag_Pico": peak_lag,
+                "Delta_AIC": float(delta_aic),
+                "Diff_Pico_IC95": (
+                    f"{ef_diff_peak:.3f} [{ic_inf:.3f}, {ic_sup:.3f}]"
+                ),
+                "p_valor_pico": float(p_val_peak),
+                "AF_Evitavel (%)": f"{structural_af:.1f}%",
+                "Casos_Evitaveis (AN)": int(np.round(avoidable_cases)),
+                "Pseudo_R2": float(pseudo_r2),
+                "LjungBox_p": float(lb_pvalue),
+            })
+
+    df_res = pd.DataFrame(block_results)
+    final_tables[block_name] = df_res
+
+    if not df_res.empty:
+      cols_display = [
+          "Estado",
+          "Variavel_Clima",
+          "Modificador",
+          "Sazonalidade",
+          "Lag_Pico",
+          "Delta_AIC",
+          "Diff_Pico_IC95",
+          "p_valor_pico",
+          "AF_Evitavel (%)",
+          "Casos_Evitaveis (AN)",
+          "Pseudo_R2",
+          "LjungBox_p",
+      ]
+      df_display = df_res.copy()
+      df_display["p_valor_pico"] = df_display["p_valor_pico"].apply(
+          lambda x: "< 0.001" if x < 0.001 else f"{x:.4f}"
+      )
+      df_display["LjungBox_p"] = df_display["LjungBox_p"].apply(
+          lambda x: f"{x:.3f}"
+      )
+      print(
+          df_display[cols_display]
+          .sort_values(["Estado", "Delta_AIC"])
+          .to_string(index=False)
+      )
+    else:
+      print("No models met the criteria for this block.")
+
+  return final_tables
